@@ -23,6 +23,9 @@ log = "0.4.22"
 env_logger = "0.11.5"
 prost = "0.13.2"
 internet-packet = { version = "0.2.0", features = ["checksums"] }
+net-route = "0.4.4"
+futures = "0.3"
+flexi_logger = "0.22"
 
 [target.'cfg(windows)'.dev-dependencies]
 hex = "0.4.3"

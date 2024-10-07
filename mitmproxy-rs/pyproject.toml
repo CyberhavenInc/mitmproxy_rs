@@ -17,7 +17,6 @@ classifiers = [
 ]
 
 dependencies = [
-    "mitmproxy_windows; os_name == 'nt'",
     "mitmproxy_macos; sys_platform == 'darwin'",
 ]
 

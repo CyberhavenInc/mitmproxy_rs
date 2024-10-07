@@ -23,6 +23,14 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use windivert::address::WinDivertAddress;
 use windivert::prelude::*;
+use std::sync::{Arc, atomic::{AtomicBool}};
+use futures;
+use futures::StreamExt;
+use flexi_logger::{Logger, FileSpec};
+use net_route::RouteChange::{Add, Delete};
+use std::sync::atomic::Ordering;
+use net_route::Route;
+use windivert::CloseAction::Nothing;
 
 #[derive(Debug)]
 enum Event {
@@ -88,9 +96,11 @@ impl ActiveListeners {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if cfg!(debug_assertions) {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    }
+    Logger::try_with_str("info")?
+        .log_to_file(FileSpec::default().basename("windows-redirector").suffix("log")) // Log to a file
+        .append() // Append to the log file, don't overwrite
+        .start()?;
+    
     let args: Vec<String> = env::args().collect();
     let pipe_name = args
         .get(1)
@@ -109,26 +119,16 @@ async fn main() -> Result<()> {
     // only needed for forward mode
     // let _icmp_handle = WinDivert::new("icmp", WinDivertLayer::Network, 1042, WinDivertFlags::new().set_drop()).context("Error opening WinDivert handle")?;
 
-    let socket_handle = WinDivert::socket(
-        "tcp || udp",
-        1041,
-        WinDivertFlags::new().set_recv_only().set_sniff(),
-    )?;
-    let network_handle = WinDivert::network("tcp || udp", 1040, WinDivertFlags::new())?;
     let inject_handle = WinDivert::network("false", 1039, WinDivertFlags::new().set_send_only())?;
-
     let tx_clone = event_tx.clone();
-    thread::spawn(move || relay_socket_events(socket_handle, tx_clone));
-    let tx_clone = event_tx.clone();
-    thread::spawn(move || relay_network_events(network_handle, tx_clone));
-
+    tokio::spawn(async move { let _ = windivert_manager(tx_clone).await; });
     let mut state = InterceptConf::disabled();
     event_tx.send(Event::Ipc(ipc::from_proxy::Message::InterceptConf(state.clone().into())))?;
 
     tokio::spawn(async move {
         if let Err(e) = handle_ipc(ipc_client, ipc_rx, event_tx).await {
             error!("Error handling IPC: {}", e);
-            std::process::exit(1);
+            //std::process::exit(1);
         }
     });
 
@@ -335,7 +335,7 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                info!(
+                debug!(
                     "Injecting: {} {} with outbound={} loopback={}",
                     packet.connection_id(),
                     packet.tcp_flag_str(),
@@ -415,7 +415,7 @@ async fn handle_ipc(
                         tx.send(Event::Ipc(message))?;
                     }
                     _ => {
-                        info!("IPC read failed. Exiting.");
+                        info!("IPC read failed. Exiting. {:?}",r);
                         std::process::exit(0);
                     }
                 }
@@ -430,10 +430,137 @@ async fn handle_ipc(
     }
 }
 
+fn compare_routes(first: Route, second: Route) -> Route {
+    if first.destination == Ipv4Addr::new(0,0,0,0) && second.destination != Ipv4Addr::new(0,0,0,0) {
+        return first;
+    }
+    if first.destination != Ipv4Addr::new(0,0,0,0) && second.destination == Ipv4Addr::new(0,0,0,0) {
+        return second;
+    }
+    if first.destination != Ipv4Addr::new(0,0,0,0) && second.destination != Ipv4Addr::new(0,0,0,0) {
+        if first.metric.unwrap_or(9999) < second.metric.unwrap_or(9999) {
+            return first;
+        }
+    }
+    // here we have both destinations == "0.0.0.0"
+    if first.gateway == Some(IpAddr::V4(Ipv4Addr::new(0,0,0,0))) && second.gateway != Some(IpAddr::V4(Ipv4Addr::new(0,0,0,0))) {
+        return first;
+    }
+    if first.gateway != Some(IpAddr::V4(Ipv4Addr::new(0,0,0,0))) && second.gateway == Some(IpAddr::V4(Ipv4Addr::new(0,0,0,0))) {
+        return second;
+    }
+    // here we have either both gateways equal or different than "0.0.0.0"
+    
+    if first.metric.unwrap_or(9999) < second.metric.unwrap_or(9999) {
+        return first;
+    }
+    return second;
+} 
+
+/// Repeatedly call WinDivertRecvEx to get network packets and feed them into the channel.
+async fn windivert_manager(tx: UnboundedSender<Event>) -> Result<()> {
+    loop {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handle = net_route::Handle::new()?;
+        let stream = handle.list().await?;
+        let mut best_route = Route { destination: "192.168.1.1".parse().unwrap(), // Example required field
+                                    prefix: 24, // Example required field
+                                    gateway: None,  // Example optional field
+                                    ifindex: None,  // Example optional field
+                                    metric: None,   // Example optional field
+                                    luid: None };
+        let mut if_idx = 0;
+        info!("Querying route table...");
+        for route in stream {
+            if best_route.luid == None {
+                best_route = route;
+                continue;
+            }
+            
+            best_route = compare_routes(best_route, route).clone();
+            if_idx = best_route.ifindex.unwrap_or(0);
+        }
+        info!("Querying route table done.");
+        info!("Setting ifIndex for {:?}", best_route);
+
+        let mut windivert_filter = "tcp || udp".to_string();
+        if if_idx != 0 {
+            windivert_filter = format!("(tcp || udp) && ifIdx == {}",if_idx);
+        }
+
+        let socket_handle = WinDivert::socket(
+            "tcp || udp",
+            1041,
+            WinDivertFlags::new().set_recv_only().set_sniff(),
+        )?;
+        let network_handle = WinDivert::network(&windivert_filter, 1040, WinDivertFlags::new())?;
+        
+        let tx_clone = tx.clone();
+        let stop_flag_clone = Arc::clone(&stop_flag);
+        let socket_thread = thread::spawn(move || relay_socket_events(socket_handle, tx_clone, stop_flag_clone));
+
+        let tx_clone = tx.clone();
+        let stop_flag_clone = Arc::clone(&stop_flag);
+        let network_thread = thread::spawn(move || relay_network_events(network_handle, tx_clone, stop_flag_clone));
+
+        let stream = handle.route_listen_stream();
+        futures::pin_mut!(stream);
+        info!("Waiting for changes... ");
+        while let Some(event) = stream.next().await {
+            info!("Matching event...");
+            match event {
+                Add(_route) | Delete(_route) => {
+                    info!("Matched an add/delete event... {:?}",_route);
+                    if _route.destination == Ipv4Addr::new(0,0,0,0) {
+                        info!("Resetting...");
+                        thread::sleep(Duration::from_millis(1000));
+                        stop_flag.store(true,Ordering::SeqCst);
+                        // We use timeout because of the nature of WinDivert crate. If we listen on a wrong interface, 
+                        // the recv function is blocking and we cannot exit otherwise.
+                        let _ = socket_thread.join_timeout(Duration::from_secs(1));
+                        info!("Socket stopped...");
+                        let _ = network_thread.join_timeout(Duration::from_secs(1));
+                        info!("Network stopped...");
+                        break;
+                    }  
+                }  
+                _ => {
+                    info!("Nothing matched...");
+                }
+            }
+        }
+    }
+}
+
+// Extending thread join with timeout
+trait JoinTimeout {
+    fn join_timeout(&self, timeout: Duration) -> Result<(), ()>;
+}
+
+impl JoinTimeout for thread::JoinHandle<()> {
+    fn join_timeout(&self, timeout: Duration) -> Result<(), ()> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if thread::panicking() {
+                return Err(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(())
+        
+    }
+}
+
 /// Repeatedly call WinDivertRecvEx to get socket info and feed them into the channel.
-fn relay_socket_events(handle: WinDivert<SocketLayer>, tx: UnboundedSender<Event>) {
+fn relay_socket_events(mut handle: WinDivert<SocketLayer>, tx: UnboundedSender<Event>, stop_flag: Arc<AtomicBool>) {
     loop {
         let packets = handle.recv_ex(1); // FIXME: more?
+        if stop_flag.load(Ordering::SeqCst) == true {
+            let _ = handle.close(Nothing);
+            info!("Thread socket stopping...");
+            return;
+        }
         match packets {
             Ok(packets) => {
                 for packet in packets {
@@ -451,11 +578,16 @@ fn relay_socket_events(handle: WinDivert<SocketLayer>, tx: UnboundedSender<Event
 }
 
 /// Repeatedly call WinDivertRecvEx to get network packets and feed them into the channel.
-fn relay_network_events(handle: WinDivert<NetworkLayer>, tx: UnboundedSender<Event>) {
+fn relay_network_events(mut handle: WinDivert<NetworkLayer>, tx: UnboundedSender<Event>, stop_flag: Arc<AtomicBool>) {
     const MAX_PACKETS: usize = 1;
     let mut buf = [0u8; MAX_PACKET_SIZE * MAX_PACKETS];
     loop {
         let packets = handle.recv_ex(Some(&mut buf), MAX_PACKETS);
+        if stop_flag.load(Ordering::SeqCst) == true {
+            info!("Thread network stopping...");
+            let _ = handle.close(Nothing);
+            return;
+        }
         match packets {
             Ok(packets) => {
                 for packet in packets {
@@ -529,7 +661,7 @@ async fn process_packet(
                 .context("failed to re-inject packet")?;
         }
         ConnectionAction::Intercept(ProcessInfo { pid, process_name }) => {
-            info!(
+            debug!(
                 "Intercepting: {} {} outbound={} loopback={}",
                 packet.connection_id(),
                 packet.tcp_flag_str(),
