@@ -5,7 +5,5 @@ datas = collect_data_files("mitmproxy_rs")
 
 hiddenimports = []
 
-if sys.platform == "darwin":
-    hiddenimports.append("mitmproxy_macos")
-elif sys.platform == "win32":
+if sys.platform == "win32":
     hiddenimports.append("mitmproxy_windows")
