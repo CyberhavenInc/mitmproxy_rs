@@ -34,7 +34,9 @@ pub struct MacosConf;
 async fn start_redirector(listener_addr: String) -> Result<()> {
     log::debug!("Starting redirector app...");
     let redirector_process =
-        Command::new("/Applications/Mitmproxy Redirector.app/Contents/MacOS/Mitmproxy Redirector")
+        Command::new("/Applications/Cyberhaven.app/Contents/MacOS/Cyberhaven")
+            .arg("network-redirector")
+            .arg("start")
             .arg(listener_addr)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

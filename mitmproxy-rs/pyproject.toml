@@ -17,7 +17,6 @@ classifiers = [
 ]
 
 dependencies = [
-    "mitmproxy_macos; sys_platform == 'darwin'",
 ]
 
 [tool.black]
